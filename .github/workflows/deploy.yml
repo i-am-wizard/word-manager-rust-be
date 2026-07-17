@@ -1,0 +1,82 @@
+name: Deploy Backend (Lambda)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-2
+  # SSM parameter path prefix owned by the serverless infra (Terraform is the sole writer)
+  SSM_PREFIX: /word-manager
+
+jobs:
+  deploy:
+    name: Build & deploy Rust Lambda
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Lambda binary (cargo-lambda, ARM64)
+        run: |
+          docker run --rm \
+            -v "$PWD":/app -w /app \
+            ghcr.io/cargo-lambda/cargo-lambda \
+            cargo lambda build --release --arm64
+
+      - name: Package bootstrap zip
+        run: |
+          # Flatten so the runtime entrypoint is exactly `bootstrap` at the zip root
+          zip -j bootstrap.zip target/lambda/word-manager-backend/bootstrap
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v5.1.1
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: github-actions-be-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve infra config from SSM
+        id: config
+        run: |
+          FN=$(aws ssm get-parameter --name "${SSM_PREFIX}/backend/lambda_function_name" --query Parameter.Value --output text)
+          ALIAS=$(aws ssm get-parameter --name "${SSM_PREFIX}/backend/lambda_alias" --query Parameter.Value --output text)
+          API=$(aws ssm get-parameter --name "${SSM_PREFIX}/backend/api_gateway_endpoint" --query Parameter.Value --output text)
+          echo "function_name=$FN" >> "$GITHUB_OUTPUT"
+          echo "alias=$ALIAS" >> "$GITHUB_OUTPUT"
+          echo "api_endpoint=$API" >> "$GITHUB_OUTPUT"
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name "${{ steps.config.outputs.function_name }}" \
+            --zip-file fileb://bootstrap.zip \
+            --architectures arm64 \
+            --region "${AWS_REGION}"
+          aws lambda wait function-updated \
+            --function-name "${{ steps.config.outputs.function_name }}" \
+            --region "${AWS_REGION}"
+
+      - name: Publish version and shift alias
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name "${{ steps.config.outputs.function_name }}" \
+            --region "${AWS_REGION}" \
+            --query Version --output text)
+          echo "Published version $VERSION"
+          aws lambda update-alias \
+            --function-name "${{ steps.config.outputs.function_name }}" \
+            --name "${{ steps.config.outputs.alias }}" \
+            --function-version "$VERSION" \
+            --region "${AWS_REGION}"
+
+      - name: Smoke test health endpoint
+        run: |
+          echo "Checking ${{ steps.config.outputs.api_endpoint }}/api"
+          curl -fsS "${{ steps.config.outputs.api_endpoint }}/api"
